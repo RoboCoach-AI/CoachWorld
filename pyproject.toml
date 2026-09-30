@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coachworld"
+version = "0.1.0"
+description = "Action-conditioned video world model for robot manipulation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "numpy>=1.24,<3",
+    "pillow>=10",
+    "pyyaml>=6",
+    "omegaconf>=2.3",
+    "torch>=2.2",
+    "torchvision",
+    "pandas",
+    "pyarrow",
+    "einops",
+    "transformers>=4.40",
+    "ftfy",
+    "regex",
+    "sentencepiece",
+    "accelerate",
+    "safetensors",
+    "diffusers>=0.30",
+    "opencv-python",
+    "av",
+    "h5py",
+    "imageio-ffmpeg",
+    "scikit-image",
+    "lpips",
+    "mediapy",
+    "tqdm",
+    "wandb",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.8"]
+
+[tool.setuptools]
+license-files = ["LICENSE", "licenses/Apache-2.0.txt"]
+
+[tool.setuptools.packages.find]
+include = ["coachworld*"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/**/*.py" = ["E402"]
+"tests/**/*.py" = ["E402"]
+"coachworld/wan/model.py" = ["E402"]

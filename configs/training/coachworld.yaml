@@ -1,0 +1,196 @@
+# CoachWorld training example. Set the run length and asset roots locally.
+
+experiment_name: "coachworld_training"
+output_dir: "${oc.env:COACHWORLD_OUTPUT_ROOT,outputs}/coachworld_training"
+seed: 42
+
+world_model:
+  backbone: "wan2.2"
+  checkpoint: "${oc.env:COACHWORLD_MODEL_ROOT,models}/Wan2.2-TI2V-5B"
+  vae_checkpoint: "${oc.env:COACHWORLD_MODEL_ROOT,models}/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+  action_dim: 10
+  text_dim: 4096
+  text_conditioning_enabled: true
+  num_inference_steps: 50
+  guidance_scale: 1.0
+  guidance_scale_min: 1.0
+  guidance_scale_max: 1.0
+
+  history_length: 5
+  pred_frames: 3
+  full_window: true
+  history_selector: "sparse"
+  history_dilations: [1, 2]
+  history_collapse_prob: 0.15
+  history_eval_dilation: 2
+  history_rollout_dilation: 2
+
+  flow_matching_shift: 3.0
+  mixed_precision: "bf16"
+  fsdp_enabled: true
+  fsdp_shard_size: 5
+  gradient_checkpoint: true
+  learning_rate: 5.0e-6
+  action_lr_mult: 1.0
+  max_train_steps: ${oc.env:COACHWORLD_MAX_TRAIN_STEPS,0}
+  batch_size: 2
+  grad_accum_steps: 4
+
+  action_condition_timestep_rate: "raw"
+  condition_mask_enabled: true
+  gt_condition_replacement: false
+  future_only_action_conditioning: true
+  action_schema: "arm_slot"
+  max_arm_slots: 2
+  action_max_time_steps: 512
+  action_kv_enabled: true
+  action_v_init_scale: 0.2
+  dense_action_film_enabled: false
+  action_adaln_modulation_enabled: true
+  action_adaln_scale: 0.15
+  action_dense_rank: 128
+  action_dense_relative_chunks: false
+  action_control_scale: 0.05
+  action_dense_layernorm_enabled: true
+  eef_projection_kv_enabled: true
+  eef_spatial_conditioning_enabled: true
+  eef_spatial_sigma_px: 16.0
+  eef_spatial_depth_scale: 2.0
+
+  action_num_domains: 8
+  action_domain_prompt_tokens: 0
+  domain_aware_action_projection_enabled: true
+  domain_aware_group_projection_enabled: false
+
+  num_cameras: 1
+  latent_height_per_view: 32
+  latent_width: 48
+  multi_view_position_mode: "global"
+  camera_id_embedding_enabled: false
+  prope_enabled: true
+  prope_zero_init: true
+  prope_spatial_stride: 16
+
+wm_training:
+  output_dir: "${oc.env:COACHWORLD_OUTPUT_ROOT,outputs}/coachworld_training"
+  loss_scale: 1.0
+  lr_schedule: "cosine"
+  lr_min_ratio: 0.10
+  gradient_clip: 1.0
+  action_param_max_abs: 100.0
+
+  cfg_dropout_text: 0.0
+  cfg_dropout_text_start: 0.0
+  cfg_dropout_text_end: 0.20
+  cfg_dropout_action: 0.0
+  cfg_dropout_action_start: 0.0
+  cfg_dropout_action_end: 0.0
+  cfg_dropout_action_decay_steps: 0
+  history_noise_max: 0.30
+  history_clean_prob: 0.25
+
+  generated_history_enabled: false
+  generated_history_probability: 0.25
+  generated_history_denoise_steps: 2
+  generated_history_blend: 0.50
+  generated_history_seed: 0
+  generated_history_dataset_keys:
+    - "droid_ext1"
+    - "droid_ext2"
+    - "robocoin_real"
+    - "vifailback_real"
+    - "giagai_real"
+
+  aux_action_weight: 0.0
+  aux_action_mask_weight: 0.05
+  counterfactual_action_weight: 0.0
+  counterfactual_action_margin: 0.02
+  counterfactual_action_mode: "roll"
+  counterfactual_action_interval: 1
+  action_warmup_steps: 0
+
+  full_window: true
+  history_selector: "sparse"
+  history_dilations: [1, 2]
+  history_collapse_prob: 0.15
+  history_eval_dilation: 2
+  history_rollout_dilation: 2
+  action_source: "video_latent_condition"
+  action_condition_timestep_rate: "raw"
+  condition_mask_enabled: true
+  gt_condition_replacement: false
+  future_only_action_conditioning: true
+  action_schema: "arm_slot"
+  max_arm_slots: 2
+  action_max_time_steps: 512
+  action_kv_enabled: true
+  action_v_init_scale: 0.2
+  dense_action_film_enabled: false
+  action_adaln_modulation_enabled: true
+  action_adaln_scale: 0.15
+  action_dense_rank: 128
+  action_dense_relative_chunks: false
+  action_control_scale: 0.05
+  action_dense_layernorm_enabled: true
+  eef_projection_kv_enabled: true
+  eef_spatial_conditioning_enabled: true
+  eef_spatial_sigma_px: 16.0
+  eef_spatial_depth_scale: 2.0
+  action_num_domains: 8
+  action_domain_prompt_tokens: 0
+  domain_aware_action_projection_enabled: true
+  domain_aware_group_projection_enabled: false
+
+  num_cameras: 1
+  latent_height_per_view: 32
+  latent_width: 48
+  multi_view_position_mode: "global"
+  camera_id_embedding_enabled: false
+  prope_enabled: true
+  prope_zero_init: true
+  prope_spatial_stride: 16
+
+  save_final_checkpoint: true
+  val_metrics_enabled: false
+  val_metrics_num_samples: 30
+  val_metrics_inference_steps: 25
+  val_metrics_rollout_mode: "fixed_chunks"
+  val_metrics_closed_loop_chunks: 4
+  val_metrics_seed: 0
+  val_metrics_lpips_net: "alex"
+  val_metrics_lpips_batch_size: 4
+  val_metrics_save_videos: true
+  val_metrics_fps: 5.0
+  wandb_project: "coachworld-training"
+  wandb_run_name: "coachworld_training"
+  require_val_split: true
+  text_encoder_device: "auto"
+  text_conditioning_enabled: true
+  text_embedding_cache_limit: 32
+
+  dataset_format: "video_latent"
+  dataset_roots:
+    - "${oc.env:COACHWORLD_DATA_ROOT,data}/video_latent"
+
+  dataset_probs: [1.0]
+  mixture_sampler_seed: 0
+  mixture_samples_per_epoch: 0
+  val_dataset_probs: [1.0]
+  video_latent_video_keys: []
+  video_latent_condition_view: "arm_slot_eef_pose"
+  video_latent_sample_stride: 8
+  video_latent_camera_conditioning: true
+  video_latent_camera_sidecar_roots: []
+  video_latent_camera_intrinsics_fallback: "error"
+  video_latent_camera_extrinsics_convention: "camera_from_world"
+  video_latent_eef_projection_mode: "online"
+  video_latent_eef_projection_roots: []
+  video_latent_require_production_contract: true
+  video_latent_required_target_fps: 5.0
+  video_latent_required_target_image_hw: [512, 768]
+
+  rgb_skip: 1
+  down_sample: 1
+  annotation_name: "annotation"
+  allow_empty_text: true
+  val_video_num: 15

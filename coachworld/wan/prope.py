@@ -1,0 +1,539 @@
+# MIT License
+#
+# Copyright (c) Authors of
+# "PRoPE: Projective Positional Encoding for Multiview Transformers"
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# How to use PRoPE attention for self-attention:
+#
+# 1. Easiest way (fast):
+#    attn = PropeDotProductAttention(...)
+#    o = attn(q, k, v, viewmats, Ks)
+#
+# 2. More flexible way (fast):
+#    attn = PropeDotProductAttention(...)
+#    attn._precompute_and_cache_apply_fns(viewmats, Ks)
+#    q = attn._apply_to_q(q)
+#    k = attn._apply_to_kv(k)
+#    v = attn._apply_to_kv(v)
+#    o = F.scaled_dot_product_attention(q, k, v, **kwargs)
+#    o = attn._apply_to_o(o)
+#
+# 3. The most flexible way (but slower because repeated computation of RoPE coefficients):
+#    o = prope_dot_product_attention(q, k, v, ...)
+#
+# How to use PRoPE attention for cross-attention:
+#
+#    attn_src = PropeDotProductAttention(...)
+#    attn_tgt = PropeDotProductAttention(...)
+#    attn_src._precompute_and_cache_apply_fns(viewmats_src, Ks_src)
+#    attn_tgt._precompute_and_cache_apply_fns(viewmats_tgt, Ks_tgt)
+#    q_src = attn_src._apply_to_q(q_src)
+#    k_tgt = attn_tgt._apply_to_kv(k_tgt)
+#    v_tgt = attn_tgt._apply_to_kv(v_tgt)
+#    o_src = F.scaled_dot_product_attention(q_src, k_tgt, v_tgt, **kwargs)
+#    o_src = attn_src._apply_to_o(o_src)
+
+from functools import partial
+from typing import Callable, Optional, Tuple, List
+
+import torch
+import torch.nn.functional as F
+
+
+def prope_qkv(
+    q: torch.Tensor,  # (batch, num_heads, seqlen, head_dim)
+    k: torch.Tensor,  # (batch, num_heads, seqlen, head_dim)
+    v: torch.Tensor,  # (batch, num_heads, seqlen, head_dim)
+    *,
+    viewmats: torch.Tensor,  # (batch, cameras, 4, 4) or (batch, frames, cameras, 4, 4)
+    Ks: Optional[torch.Tensor],  # matching viewmats camera axes, ending in (3, 3)
+    patches_x: int = None,  # How many patches wide is each image?
+    patches_y: int = None,  # How many patches tall is each image?
+    image_width: int = None,  # Width of the image. Used to normalize intrinsics.
+    image_height: int = None,  # Height of the image. Used to normalize intrinsics.
+    coeffs_x: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    coeffs_y: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    mask: Optional[torch.Tensor] = None,
+    kv_cache=None,
+    is_cache: bool = False,
+    **kwargs,
+) -> torch.Tensor:
+    """Similar to torch.nn.functional.scaled_dot_product_attention, but applies PRoPE-style
+    positional encoding.
+
+    For the original minWM path, we assume that the sequence length is equal to:
+
+        cameras * patches_x * patches_y
+
+    And token ordering allows the `(seqlen,)` axis to be reshaped into
+    `(cameras, patches_x, patches_y)`.
+
+    For non-causal height-stacked video latents, pass ``viewmats`` as
+    ``(B,F,V,4,4)`` and ``Ks`` as ``(B,F,V,3,3)``. This activates the
+    per-patch ray path: tokens are ordered as ``(F,V,patch_y,patch_x)`` and
+    each token receives its own ray-frame projective transform.
+    """
+    # We're going to assume self-attention: all inputs are the same shape.
+    (batch, num_heads, seqlen, head_dim) = q.shape
+    assert q.shape == k.shape == v.shape
+    if viewmats.ndim == 5:
+        apply_fn_q, apply_fn_kv, apply_fn_o = _prepare_apply_fns_per_patch_ray(
+            head_dim=head_dim,
+            seqlen=seqlen,
+            viewmats=viewmats,
+            Ks=Ks,
+            patches_x=patches_x,
+            patches_y=patches_y,
+            image_width=image_width,
+            image_height=image_height,
+        )
+    else:
+        cameras = viewmats.shape[1]
+        assert viewmats.shape == (batch, cameras, 4, 4)
+        assert Ks is None or Ks.shape == (batch, cameras, 3, 3)
+        # assert seqlen == cameras * patches_x * patches_y
+
+        apply_fn_q, apply_fn_kv, apply_fn_o = _prepare_apply_fns_all_dim(
+            head_dim=head_dim,
+            viewmats=viewmats,
+            Ks=Ks,
+            patches_x=patches_x,
+            patches_y=patches_y,
+            image_width=image_width,
+            image_height=image_height,
+            coeffs_x=coeffs_x,
+            coeffs_y=coeffs_y,
+        )
+
+    query = apply_fn_q(q)
+    key = apply_fn_kv(k)
+    value = apply_fn_kv(v)
+
+    return query, key, value, apply_fn_o
+
+
+def _prepare_apply_fns_per_patch_ray(
+    head_dim: int,
+    seqlen: int,
+    viewmats: torch.Tensor,  # (batch, frames, cameras, 4, 4)
+    Ks: Optional[torch.Tensor],  # (batch, frames, cameras, 3, 3)
+    patches_x: int,
+    patches_y: int,
+    image_width: int,
+    image_height: int,
+) -> Tuple[
+    Callable[[torch.Tensor], torch.Tensor],
+    Callable[[torch.Tensor], torch.Tensor],
+    Callable[[torch.Tensor], torch.Tensor],
+]:
+    """Prepare per-token PRoPE transforms from patch-center camera rays."""
+    if patches_x is None or patches_y is None:
+        raise ValueError("per-patch PRoPE requires patches_x and patches_y")
+    batch, frames, cameras, _, _ = viewmats.shape
+    if Ks is not None and Ks.shape != (batch, frames, cameras, 3, 3):
+        raise ValueError(
+            "Ks must match viewmats camera axes for per-patch PRoPE: "
+            f"got Ks={tuple(Ks.shape)}, viewmats={tuple(viewmats.shape)}"
+        )
+    expected = frames * cameras * int(patches_y) * int(patches_x)
+    if int(seqlen) != expected:
+        raise ValueError(
+            "per-patch PRoPE token layout mismatch: "
+            f"seqlen={seqlen}, expected F*V*patches_y*patches_x={expected} "
+            f"from F={frames}, V={cameras}, patches_y={patches_y}, patches_x={patches_x}"
+        )
+    assert head_dim % 4 == 0
+
+    P, P_inv = _make_patch_ray_projective_mats(
+        viewmats=viewmats,
+        Ks=Ks,
+        patches_x=int(patches_x),
+        patches_y=int(patches_y),
+        image_width=image_width,
+        image_height=image_height,
+    )
+    P_T = P.transpose(-1, -2).to(dtype=viewmats.dtype)
+    P_inv = P_inv.to(dtype=viewmats.dtype)
+    P = P.to(dtype=viewmats.dtype)
+    assert P.shape == P_inv.shape == (batch, seqlen, 4, 4)
+
+    transforms_q = [(partial(_apply_token_projmat, matrix=P_T), head_dim)]
+    transforms_kv = [(partial(_apply_token_projmat, matrix=P_inv), head_dim)]
+    transforms_o = [(partial(_apply_token_projmat, matrix=P), head_dim)]
+
+    apply_fn_q = partial(_apply_block_diagonal, func_size_pairs=transforms_q)
+    apply_fn_kv = partial(_apply_block_diagonal, func_size_pairs=transforms_kv)
+    apply_fn_o = partial(_apply_block_diagonal, func_size_pairs=transforms_o)
+    return apply_fn_q, apply_fn_kv, apply_fn_o
+
+
+def _prepare_apply_fns_all_dim(
+    head_dim: int,  # Q/K/V will have this last dimension
+    viewmats: torch.Tensor,  # (batch, cameras, 4, 4)
+    Ks: Optional[torch.Tensor],  # (batch, cameras, 3, 3)
+    patches_x: int,  # How many patches wide is each image?
+    patches_y: int,  # How many patches tall is each image?
+    image_width: int,  # Width of the image. Used to normalize intrinsics.
+    image_height: int,  # Height of the image. Used to normalize intrinsics.
+    coeffs_x: Optional[torch.Tensor] = None,
+    coeffs_y: Optional[torch.Tensor] = None,
+) -> Tuple[
+    Callable[[torch.Tensor], torch.Tensor],
+    Callable[[torch.Tensor], torch.Tensor],
+    Callable[[torch.Tensor], torch.Tensor],
+]:
+    """Prepare transforms for PRoPE-style positional encoding."""
+    (batch, cameras, _, _) = viewmats.shape
+
+    # Normalize camera intrinsics.
+    if Ks is not None:
+        Ks_norm = torch.zeros_like(Ks)
+        Ks_norm[..., 0, 0] = Ks[..., 0, 0]
+        Ks_norm[..., 1, 1] = Ks[..., 1, 1]
+        Ks_norm[..., 0, 2] = 0
+        Ks_norm[..., 1, 2] = 0
+        Ks_norm[..., 2, 2] = 1.0
+        Ks_norm = Ks_norm.to(dtype=Ks.dtype)
+        del Ks
+
+        # Compute the camera projection matrices we use in PRoPE.
+        # - K is an `image<-camera` transform.
+        # - viewmats is a `camera<-world` transform.
+        # - P = lift(K) @ viewmats is an `image<-world` transform.
+        P = torch.einsum("...ij,...jk->...ik", _lift_K(Ks_norm), viewmats)
+        P_T = P.transpose(-1, -2).to(dtype=viewmats.dtype)
+        P_inv = torch.einsum(
+            "...ij,...jk->...ik",
+            _invert_SE3(viewmats),
+            _lift_K(_invert_K(Ks_norm)),
+        ).to(dtype=viewmats.dtype)
+
+    else:
+        # GTA formula. P is `camera<-world` transform.
+        P = viewmats
+        P_T = P.transpose(-1, -2)
+        P_inv = _invert_SE3(viewmats)
+
+    assert P.shape == P_inv.shape == (batch, cameras, 4, 4)
+
+    # Block-diagonal transforms to the inputs and outputs of the attention operator.
+    assert head_dim % 4 == 0
+    transforms_q = [
+        (partial(_apply_tiled_projmat, matrix=P_T), head_dim),
+    ]
+    transforms_kv = [
+        (partial(_apply_tiled_projmat, matrix=P_inv), head_dim),
+    ]
+    transforms_o = [
+        (partial(_apply_tiled_projmat, matrix=P), head_dim),
+    ]
+
+    apply_fn_q = partial(_apply_block_diagonal, func_size_pairs=transforms_q)
+    apply_fn_kv = partial(_apply_block_diagonal, func_size_pairs=transforms_kv)
+    apply_fn_o = partial(_apply_block_diagonal, func_size_pairs=transforms_o)
+    return apply_fn_q, apply_fn_kv, apply_fn_o
+
+
+def _apply_tiled_projmat(
+    feats: torch.Tensor,  # (batch, num_heads, seqlen, feat_dim)
+    matrix: torch.Tensor,  # (batch, cameras, D, D)
+) -> torch.Tensor:
+    """Apply projection matrix to features."""
+    # - seqlen => (cameras, patches_x * patches_y)
+    # - feat_dim => (feat_dim // 4, 4)
+    (batch, num_heads, seqlen, feat_dim) = feats.shape
+    cameras = matrix.shape[1]
+    assert seqlen >= cameras and seqlen % cameras == 0
+    D = matrix.shape[-1]
+    assert matrix.shape == (batch, cameras, D, D)
+    assert feat_dim % D == 0
+    return torch.einsum(
+        "bcij,bncpkj->bncpki",
+        matrix,
+        feats.reshape((batch, num_heads, cameras, -1, feat_dim // D, D)),
+    ).reshape(feats.shape)
+
+
+def _apply_token_projmat(
+    feats: torch.Tensor,  # (batch, num_heads, seqlen, feat_dim)
+    matrix: torch.Tensor,  # (batch, seqlen, D, D)
+) -> torch.Tensor:
+    """Apply one projection matrix per visual token."""
+    batch, num_heads, seqlen, feat_dim = feats.shape
+    D = matrix.shape[-1]
+    assert matrix.shape == (batch, seqlen, D, D)
+    assert feat_dim % D == 0
+    matrix = matrix.to(device=feats.device, dtype=feats.dtype)
+    return torch.einsum(
+        "blij,bnlkj->bnlki",
+        matrix,
+        feats.reshape((batch, num_heads, seqlen, feat_dim // D, D)),
+    ).reshape(feats.shape)
+
+
+def _make_patch_ray_projective_mats(
+    *,
+    viewmats: torch.Tensor,
+    Ks: Optional[torch.Tensor],
+    patches_x: int,
+    patches_y: int,
+    image_width: Optional[int],
+    image_height: Optional[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build per-token ray-frame matrices.
+
+    ``viewmats`` is camera<-world. For each patch center, we compute a
+    camera-frame ray, rotate it into world frame, and build a local ray frame
+    anchored at the camera center. Returned matrices follow the same contract
+    as the original PRoPE code: P is local<-world and P_inv is world<-local.
+    """
+    device = viewmats.device
+    dtype = viewmats.dtype
+    vm = viewmats.float()
+    B, F_, V, _, _ = vm.shape
+
+    ray_cam = _patch_camera_rays(
+        Ks=Ks,
+        patches_x=patches_x,
+        patches_y=patches_y,
+        image_width=image_width,
+        image_height=image_height,
+        batch=B,
+        frames=F_,
+        cameras=V,
+        device=device,
+    )  # (B,F,V,py,px,3)
+
+    R_cw = vm[..., :3, :3]
+    t_cw = vm[..., :3, 3]
+    R_wc = R_cw.transpose(-1, -2)
+    ray_world = torch.einsum("bfvij,bfvyxj->bfvyxi", R_wc, ray_cam)
+    ray_world = F.normalize(ray_world, dim=-1, eps=1e-6)
+
+    camera_center = -torch.einsum("bfvij,bfvj->bfvi", R_wc, t_cw)
+    camera_center = camera_center[:, :, :, None, None, :].expand_as(ray_world)
+
+    up_ref = torch.zeros(3, device=device, dtype=torch.float32)
+    up_ref[2] = 1.0
+    right = torch.cross(up_ref.view(1, 1, 1, 1, 1, 3).expand_as(ray_world), ray_world, dim=-1)
+    alt_ref = torch.zeros(3, device=device, dtype=torch.float32)
+    alt_ref[1] = 1.0
+    right_alt = torch.cross(
+        alt_ref.view(1, 1, 1, 1, 1, 3).expand_as(ray_world),
+        ray_world,
+        dim=-1,
+    )
+    right_norm = right.norm(dim=-1, keepdim=True)
+    right = torch.where(right_norm > 1e-5, right, right_alt)
+    right = F.normalize(right, dim=-1, eps=1e-6)
+    up = F.normalize(torch.cross(ray_world, right, dim=-1), dim=-1, eps=1e-6)
+
+    world_from_ray = torch.zeros(
+        (B, F_, V, patches_y, patches_x, 4, 4),
+        device=device,
+        dtype=torch.float32,
+    )
+    world_from_ray[..., :3, 0] = right
+    world_from_ray[..., :3, 1] = up
+    world_from_ray[..., :3, 2] = ray_world
+    world_from_ray[..., :3, 3] = camera_center
+    world_from_ray[..., 3, 3] = 1.0
+
+    P_inv = world_from_ray.reshape(B, F_ * V * patches_y * patches_x, 4, 4)
+    P = _invert_SE3(P_inv)
+    return P.to(dtype=dtype), P_inv.to(dtype=dtype)
+
+
+def _patch_camera_rays(
+    *,
+    Ks: Optional[torch.Tensor],
+    patches_x: int,
+    patches_y: int,
+    image_width: Optional[int],
+    image_height: Optional[int],
+    batch: int,
+    frames: int,
+    cameras: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return normalized camera-frame patch rays, shape (B,F,V,py,px,3)."""
+    xs = torch.arange(patches_x, device=device, dtype=torch.float32) + 0.5
+    ys = torch.arange(patches_y, device=device, dtype=torch.float32) + 0.5
+    x_norm = xs / float(patches_x) * 2.0 - 1.0
+    y_norm = ys / float(patches_y) * 2.0 - 1.0
+    yy_norm, xx_norm = torch.meshgrid(y_norm, x_norm, indexing="ij")
+
+    ray_x = xx_norm.view(1, 1, 1, patches_y, patches_x)
+    ray_y = yy_norm.view(1, 1, 1, patches_y, patches_x)
+    ray_x = ray_x.expand(batch, frames, cameras, patches_y, patches_x)
+    ray_y = ray_y.expand(batch, frames, cameras, patches_y, patches_x)
+
+    if Ks is not None and image_width is not None and image_height is not None:
+        K = Ks.to(device=device, dtype=torch.float32)
+        if K.shape != (batch, frames, cameras, 3, 3):
+            raise ValueError(
+                f"Ks shape must be {(batch, frames, cameras, 3, 3)}, got {tuple(K.shape)}"
+            )
+        u = xs / float(patches_x) * float(image_width)
+        v = ys / float(patches_y) * float(image_height)
+        vv, uu = torch.meshgrid(v, u, indexing="ij")
+        uu = uu.view(1, 1, 1, patches_y, patches_x)
+        vv = vv.view(1, 1, 1, patches_y, patches_x)
+
+        fx = K[..., 0, 0]
+        fy = K[..., 1, 1]
+        cx = K[..., 0, 2]
+        cy = K[..., 1, 2]
+        calibrated = (
+            torch.isfinite(fx)
+            & torch.isfinite(fy)
+            & torch.isfinite(cx)
+            & torch.isfinite(cy)
+            & (fx.abs() > 2.0)
+            & (fy.abs() > 2.0)
+        )
+        fx_safe = fx.clamp_min(1e-6)
+        fy_safe = fy.clamp_min(1e-6)
+        ray_x_k = (uu - cx[..., None, None]) / fx_safe[..., None, None]
+        ray_y_k = (vv - cy[..., None, None]) / fy_safe[..., None, None]
+        use_k = calibrated[..., None, None]
+        ray_x = torch.where(use_k, ray_x_k, ray_x)
+        ray_y = torch.where(use_k, ray_y_k, ray_y)
+
+    ones = torch.ones_like(ray_x)
+    return F.normalize(torch.stack((ray_x, ray_y, ones), dim=-1), dim=-1, eps=1e-6)
+
+
+def _apply_block_diagonal(
+    feats: torch.Tensor,  # (..., dim)
+    func_size_pairs: List[Tuple[Callable[[torch.Tensor], torch.Tensor], int]],
+) -> torch.Tensor:
+    """Apply a block-diagonal function to an input array.
+
+    Each function is specified as a tuple with form:
+
+        ((Tensor) -> Tensor, int)
+
+    Where the integer is the size of the input to the function.
+    """
+    funcs, block_sizes = zip(*func_size_pairs)
+    assert feats.shape[-1] == sum(block_sizes)
+    x_blocks = torch.split(feats, block_sizes, dim=-1)
+    out = torch.cat(
+        [f(x_block) for f, x_block in zip(funcs, x_blocks)],
+        dim=-1,
+    )
+    assert out.shape == feats.shape, "Input/output shapes should match."
+    return out
+
+
+def _invert_SE3(transforms: torch.Tensor) -> torch.Tensor:
+    """Invert a 4x4 SE(3) matrix."""
+    assert transforms.shape[-2:] == (4, 4)
+    Rinv = transforms[..., :3, :3].transpose(-1, -2)
+    out = torch.zeros_like(transforms)
+    out[..., :3, :3] = Rinv
+    out[..., :3, 3] = -torch.einsum("...ij,...j->...i", Rinv, transforms[..., :3, 3])
+    out[..., 3, 3] = 1.0
+    out = out.to(dtype=transforms.dtype)
+    return out
+
+
+def _lift_K(Ks: torch.Tensor) -> torch.Tensor:
+    """Lift 3x3 matrices to homogeneous 4x4 matrices."""
+    assert Ks.shape[-2:] == (3, 3)
+    out = torch.zeros(Ks.shape[:-2] + (4, 4), device=Ks.device)
+    out[..., :3, :3] = Ks
+    out[..., 3, 3] = 1.0
+    out = out.to(dtype=Ks.dtype)
+    return out
+
+
+def _invert_K(Ks: torch.Tensor) -> torch.Tensor:
+    """Invert 3x3 intrinsics matrices. Assumes no skew."""
+    assert Ks.shape[-2:] == (3, 3)
+    out = torch.zeros_like(Ks)
+    out[..., 0, 0] = 1.0 / Ks[..., 0, 0]
+    out[..., 1, 1] = 1.0 / Ks[..., 1, 1]
+    out[..., 0, 2] = -Ks[..., 0, 2] / Ks[..., 0, 0]
+    out[..., 1, 2] = -Ks[..., 1, 2] / Ks[..., 1, 1]
+    out[..., 2, 2] = 1.0
+    out = out.to(dtype=Ks.dtype)
+    return out
+
+
+def add_prope_parameters(model, zero_init: bool = True):
+    """Add learnable PRoPE parameters to each self-attention block.
+
+    Registers per-layer:
+    - prope_o: nn.Linear(dim, dim), zero-initialised output projection
+      for the PRoPE attention path. Output = rope_out + prope_o(prope_out).
+
+    Args:
+        model: WanModel or CausalWanModel instance
+        zero_init: If True, initialize prope_o weights and biases to zero
+    """
+    import torch.nn as nn
+
+    # Import here to avoid circular dependency. The current CoachWorld Wan model
+    # only exposes WanSelfAttention/WanI2VCrossAttention; the copied causal
+    # backend exposes CausalWanSelfAttention. Keep this helper explicit so
+    # absent upstream Wan variants do not hide real PRoPE wiring errors.
+    attn_types = []
+    excluded_types = []
+    try:
+        from .model import WanI2VCrossAttention, WanSelfAttention
+
+        attn_types.append(WanSelfAttention)
+        excluded_types.append(WanI2VCrossAttention)
+    except ImportError:
+        pass
+
+    try:
+        from .causal_model import CausalWanSelfAttention
+
+        attn_types.append(CausalWanSelfAttention)
+    except ImportError:
+        pass
+
+    attn_types = tuple(attn_types)
+    excluded_types = tuple(excluded_types)
+    if not attn_types:
+        raise RuntimeError("No compatible Wan self-attention classes found for PRoPE.")
+
+    for name, module in model.named_modules():
+        if isinstance(module, attn_types) and not isinstance(module, excluded_types):
+            if not hasattr(module, 'prope_o'):
+                # Get dim from existing projection layer
+                dim = module.o.out_features
+                prope_o = nn.Linear(dim, dim)
+
+                if zero_init:
+                    nn.init.zeros_(prope_o.weight)
+                    nn.init.zeros_(prope_o.bias)
+
+                # Move to same device/dtype as existing parameters
+                prope_o = prope_o.to(
+                    device=module.o.weight.device,
+                    dtype=module.o.weight.dtype
+                )
+
+                module.prope_o = prope_o
