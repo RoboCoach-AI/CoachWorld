@@ -17,14 +17,14 @@
 <p align="center">
   <a href="https://jedward225.github.io/">Jiajun&nbsp;Liu</a>,
   <a href="https://cyf-24.github.io/">Yifan&nbsp;Chen</a>,
-  Yichao&nbsp;Liu,
+  <a href="https://scholar.google.com/scholar?q=%22Yichao+Liu%22+RoboCoach">Yichao&nbsp;Liu</a>,
   <a href="https://zhangjiayi24.github.io/">Jiayi&nbsp;Zhang</a>,
   <a href="https://ruoqu.cc/">Ruoqu&nbsp;Chen</a>,<br />
-  Shaoxuan&nbsp;Xie,
+  <a href="https://scholar.google.com/scholar?q=%22Shaoxuan+Xie%22+RoboCOIN">Shaoxuan&nbsp;Xie</a>,
   <a href="https://scholar.google.com/citations?user=FLkv_vIAAAAJ">Guocai&nbsp;Yao</a>,
   <a href="https://www.mengdixu.me/">Mengdi&nbsp;Xu</a>,
   <a href="https://sencui-thu.github.io/">Sen&nbsp;Cui</a>,
-  <a href="https://www.au.tsinghua.edu.cn/en/info/1078/3205.htm">Changshui&nbsp;Zhang</a>
+  <a href="https://scholar.google.com/citations?user=GL9M37YAAAAJ">Changshui&nbsp;Zhang</a>
 </p>
 
 ## 🌟 Overview
